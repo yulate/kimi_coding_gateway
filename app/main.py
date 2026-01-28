@@ -19,13 +19,13 @@ app = FastAPI(title="Kimi Coding Plan Gateway")
 
 # Kimi Coding API 配置
 KIMI_BASE_URL = "https://api.kimi.com/coding/v1"
-KIMI_API_KEY = os.getenv("KIMI_API_KEY", "sk-kimi-")
+KIMI_API_KEY = os.getenv("KIMI_API_KEY", "sk-kimi-rlw5GC9jWvuOcL2mw0nZBKEw05WOgs3JpZ3jhAyQ0sOhqsnGcsWWtEccCt2xG7kR")
 
 # 关键：模拟 Kimi CLI 的 User-Agent
 KIMI_CLI_USER_AGENT = "KimiCLI/1.3"
 
 # 本地网关配置
-GATEWAY_HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
+GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8765"))
 
 
@@ -152,10 +152,28 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+def get_local_ip():
+    """获取本机局域网 IP"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
 def start_gateway():
     """启动网关服务"""
     print(f"[INFO] 启动 Kimi Coding Plan Gateway...")
-    print(f"[INFO] 网关地址: http://{GATEWAY_HOST}:{GATEWAY_PORT}")
+    print(f"[INFO] 监听地址: http://{GATEWAY_HOST}:{GATEWAY_PORT}")
+    
+    if GATEWAY_HOST == "0.0.0.0":
+        local_ip = get_local_ip()
+        print(f"[INFO] 局域网访问地址: http://{local_ip}:{GATEWAY_PORT}")
+        print(f"[WARN] 注意：允许外部访问可能导致 API Key 被局域网内其他人使用")
+        
     uvicorn.run(app, host=GATEWAY_HOST, port=GATEWAY_PORT)
 
 if __name__ == "__main__":
