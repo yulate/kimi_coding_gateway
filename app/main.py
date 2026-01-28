@@ -36,18 +36,42 @@ async def proxy_v1(path: str, request: Request):
     return await forward_request(target_url, request)
 
 
+def process_request_body(body: bytes) -> tuple[bytes, bool]:
+    """
+    处理请求体：
+    1. 检测 stream 参数
+    2. 修复 Kimi API 对 reasoning_content 的严格检查
+    """
+    if not body:
+        return body, False
+        
+    try:
+        data = json.loads(body)
+        stream = data.get("stream", False)
+        
+        # 修复逻辑：为 tool_calls 补充 reasoning_content
+        messages = data.get("messages", [])
+        modified = False
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                if "reasoning_content" not in msg:
+                    # Kimi 严格检查：如果启用了 thinking，assistant 必须包含 reasoning_content
+                    msg["reasoning_content"] = "" 
+                    modified = True
+        
+        if modified:
+            return json.dumps(data).encode("utf-8"), stream
+        return body, stream
+    except json.JSONDecodeError:
+        return body, False
+
+
 async def forward_request(target_url: str, request: Request):
     """转发请求到 Kimi Coding API"""
-    body = await request.body()
-    
-    # 检查是否需要流式响应
-    stream = False
-    if body:
-        try:
-            body_json = json.loads(body)
-            stream = body_json.get("stream", False)
-        except json.JSONDecodeError:
-            pass
+    # 获取原始 body
+    original_body = await request.body()
+    # 处理 body（自动修复 messages）
+    body, stream = process_request_body(original_body)
     
     if stream:
         return await handle_stream_request(target_url, body)
