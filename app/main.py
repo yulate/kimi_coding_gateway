@@ -19,7 +19,7 @@ app = FastAPI(title="Kimi Coding Plan Gateway")
 
 # Kimi Coding API 配置
 KIMI_BASE_URL = "https://api.kimi.com/coding/v1"
-KIMI_API_KEY = os.getenv("KIMI_API_KEY", "sk-kimi-rlw5GC9jWvuOcL2mw0nZBKEw05WOgs3JpZ3jhAyQ0sOhqsnGcsWWtEccCt2xG7kR")
+KIMI_API_KEY = os.getenv("KIMI_API_KEY", "sk-kimi")
 
 # 关键：模拟 Kimi CLI 的 User-Agent
 KIMI_CLI_USER_AGENT = "KimiCLI/1.3"
@@ -49,14 +49,15 @@ def process_request_body(body: bytes) -> tuple[bytes, bool]:
         data = json.loads(body)
         stream = data.get("stream", False)
         
-        # 修复逻辑：为 tool_calls 补充 reasoning_content
+        # 修复逻辑：为 assistant 消息补充 reasoning_content
         messages = data.get("messages", [])
         modified = False
-        for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "assistant":
+                # Kimi API 严格要求 Thinking 模型必须包含 reasoning_content
+                # 无论是普通回复还是 Tool Call，都可能需要
                 if "reasoning_content" not in msg:
-                    # Kimi 严格检查：如果启用了 thinking，assistant 必须包含 reasoning_content
-                    msg["reasoning_content"] = "" 
+                    msg["reasoning_content"] = " " # 注入一个空格或点，尽量减少对模型的影响
                     modified = True
         
         if modified:
