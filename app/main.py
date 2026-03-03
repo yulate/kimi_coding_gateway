@@ -3,9 +3,11 @@ Kimi Coding Plan API Gateway
 将 OpenAI 兼容的请求转发到 Kimi Coding Plan API (api.kimi.com/coding)
 """
 import os
+import asyncio
 import json
 import httpx
-from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
@@ -19,7 +21,8 @@ app = FastAPI(title="Kimi Coding Plan Gateway")
 
 # Kimi Coding API 配置
 KIMI_BASE_URL = "https://api.kimi.com/coding/v1"
-KIMI_API_KEY = os.getenv("KIMI_API_KEY", "sk-kimi")
+# 使用 or 运算符处理空字符串的情况 (当 docker-compose 传递空值时)
+KIMI_API_KEY = os.getenv("KIMI_API_KEY") or "sk-kimi"
 
 # 关键：模拟 Kimi CLI 的 User-Agent
 KIMI_CLI_USER_AGENT = "KimiCLI/1.3"
@@ -27,6 +30,60 @@ KIMI_CLI_USER_AGENT = "KimiCLI/1.3"
 # 本地网关配置
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8765"))
+
+# 调试配置
+DEBUG_MODE = os.getenv("GATEWAY_DEBUG", "false").lower() == "true"
+DEBUG_JSONL_FILE = os.getenv("GATEWAY_DEBUG_JSONL_FILE", "gateway_requests.jsonl")
+DEBUG_WRITE_LOCK = asyncio.Lock()
+
+
+def parse_json_payload(body: bytes):
+    """解析 JSON，失败时保留原始文本与错误信息。"""
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        return {
+            "_parse_error": str(exc),
+            "_raw": body.decode("utf-8", errors="replace"),
+        }
+
+
+def parse_stream_json_events(raw_stream: bytes):
+    """解析 SSE data 行中的 JSON 事件。"""
+    text = raw_stream.decode("utf-8", errors="replace")
+    events = []
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            events.append(json.loads(payload))
+        except json.JSONDecodeError as exc:
+            events.append({"_parse_error": str(exc), "_raw": payload})
+    return events
+
+
+def write_debug_line_sync(line: str):
+    """同步写入一行 JSONL。"""
+    directory = os.path.dirname(DEBUG_JSONL_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(DEBUG_JSONL_FILE, "a", encoding="utf-8") as file_obj:
+        file_obj.write(line)
+        file_obj.write("\n")
+
+
+async def append_debug_jsonl(record: dict):
+    """异步追加 JSONL 调试日志。"""
+    if not DEBUG_MODE:
+        return
+    line = json.dumps(record, ensure_ascii=False)
+    async with DEBUG_WRITE_LOCK:
+        await asyncio.to_thread(write_debug_line_sync, line)
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -73,68 +130,32 @@ async def forward_request(target_url: str, request: Request):
     original_body = await request.body()
     # 处理 body（自动修复 messages）
     body, stream = process_request_body(original_body)
+    debug_context = {
+        "request_id": uuid4().hex,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "method": request.method,
+        "path": request.url.path,
+        "query": request.url.query,
+        "target_url": target_url,
+        "stream": stream,
+        "request_json": parse_json_payload(original_body),
+        "forwarded_request_json": parse_json_payload(body),
+    }
     
     if stream:
-        return await handle_stream_request(target_url, body)
+        return await handle_stream_request(target_url, body, debug_context)
     else:
-        return await handle_normal_request(target_url, request.method, body)
+        return await handle_normal_request(target_url, body, debug_context)
 
 
-async def handle_stream_request(target_url: str, body: bytes):
-    """处理流式请求"""
-    # 使用 httpx 低级别 API 来确保 headers 正确发送
-    async def stream_generator():
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            # 构建请求
-            req = client.build_request(
-                method="POST",
-                url=target_url,
-                content=body,
-                headers={
-                    "Authorization": f"Bearer {KIMI_API_KEY}",
-                    "Content-Type": "application/json",
-                    "User-Agent": KIMI_CLI_USER_AGENT,
-                },
-            )
-            print(f"[DEBUG] Stream Request URL: {req.url}")
-            try:
-                response = await client.send(req, stream=True)
-                print(f"[DEBUG] Stream Response Status: {response.status_code}")
-                
-                if response.status_code != 200:
-                    content = await response.aread()
-                    print(f"[DEBUG] Stream Error Body: {content}")
-                    error_msg = {"error": {"message": f"Upstream error: {response.status_code}", "type": "upstream_error"}}
-                    yield f"data: {json.dumps(error_msg)}\n\n".encode()
-                    yield b"data: [DONE]\n\n"
-                    await response.aclose()
-                    return
-
-                try:
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
-                finally:
-                    await response.aclose()
-            except Exception as e:
-                print(f"[ERROR] Stream Exception: {e}")
-                yield f"data: {{\"error\": \"{str(e)}\"}}\n\n".encode()
-    
-    return StreamingResponse(
-        stream_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-    )
-
-
-async def handle_normal_request(target_url: str, method: str, body: bytes):
-    """处理非流式请求"""
-    # 使用 httpx 低级别 API 来确保 headers 正确发送
+async def stream_generator(target_url: str, body: bytes, debug_context: dict):
+    """转发流式响应并在结束后落盘调试日志。"""
+    status_code = None
+    stream_error = None
+    raw_stream = bytearray()
     async with httpx.AsyncClient(timeout=300.0) as client:
         req = client.build_request(
-            method=method,
+            method="POST",
             url=target_url,
             content=body,
             headers={
@@ -143,18 +164,86 @@ async def handle_normal_request(target_url: str, method: str, body: bytes):
                 "User-Agent": KIMI_CLI_USER_AGENT,
             },
         )
-        
-        # 打印调试信息
-        print(f"[DEBUG] Request URL: {req.url}")
-        
-        response = await client.send(req)
-        
-        print(f"[DEBUG] Response Status: {response.status_code}")
-        
+        try:
+            response = await client.send(req, stream=True)
+            status_code = response.status_code
+            if status_code != 200:
+                content = await response.aread()
+                raw_stream.extend(content)
+                error_msg = {"error": {"message": f"Upstream error: {status_code}", "type": "upstream_error"}}
+                yield f"data: {json.dumps(error_msg)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                await response.aclose()
+                return
+            try:
+                async for chunk in response.aiter_bytes():
+                    raw_stream.extend(chunk)
+                    yield chunk
+            finally:
+                await response.aclose()
+        except Exception as exc:
+            stream_error = str(exc)
+            yield f"data: {{\"error\": \"{stream_error}\"}}\n\n".encode()
+        finally:
+            response_json = (
+                parse_stream_json_events(bytes(raw_stream))
+                if status_code == 200
+                else parse_json_payload(bytes(raw_stream))
+            )
+            debug_record = {
+                **debug_context,
+                "status_code": status_code,
+                "response_json": response_json,
+            }
+            if stream_error:
+                debug_record["upstream_exception"] = stream_error
+            await append_debug_jsonl(debug_record)
+
+
+async def handle_stream_request(target_url: str, body: bytes, debug_context: dict):
+    """处理流式请求"""
+    
+    return StreamingResponse(
+        stream_generator(target_url, body, debug_context),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+
+async def handle_normal_request(target_url: str, body: bytes, debug_context: dict):
+    """处理非流式请求"""
+    # 使用 httpx 低级别 API 来确保 headers 正确发送
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        req = client.build_request(
+            method=debug_context["method"],
+            url=target_url,
+            content=body,
+            headers={
+                "Authorization": f"Bearer {KIMI_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": KIMI_CLI_USER_AGENT,
+            },
+        )
+        try:
+            response = await client.send(req)
+        except Exception as exc:
+            await append_debug_jsonl({**debug_context, "upstream_exception": str(exc)})
+            raise
+
         try:
             content = response.json()
-        except json.JSONDecodeError:
-            content = {"data": response.text}
+        except json.JSONDecodeError as exc:
+            content = {"_parse_error": str(exc), "_raw": response.text}
+
+        debug_record = {
+            **debug_context,
+            "status_code": response.status_code,
+            "response_json": content,
+        }
+        await append_debug_jsonl(debug_record)
         
         return JSONResponse(
             content=content,
@@ -171,6 +260,8 @@ async def root():
         "kimi_base_url": KIMI_BASE_URL,
         "gateway_url": f"http://{GATEWAY_HOST}:{GATEWAY_PORT}",
         "user_agent": KIMI_CLI_USER_AGENT,
+        "debug_mode": DEBUG_MODE,
+        "debug_jsonl_file": DEBUG_JSONL_FILE,
     }
 
 @app.get("/health")

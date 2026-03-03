@@ -29,6 +29,12 @@ cp .env.example .env
 ```
 *(如果不想创建 .env 文件，网关也可以直接读取环境变量)*
 
+如需开启调试日志（完整记录每次请求/响应 JSON 到 JSONL）：
+```bash
+GATEWAY_DEBUG=true
+GATEWAY_DEBUG_JSONL_FILE=./logs/gateway_requests.jsonl
+```
+
 ### 2. 启动服务
 
 使用启动脚本（自动安装依赖）：
@@ -73,6 +79,17 @@ response = client.chat.completions.create(
 - **Base URL**: `http://127.0.0.1:8765/v1`
 - **API Key**: 任意值
 - **Model**: `kimi-for-coding`
+
+## Debug JSONL 日志
+
+开启 `GATEWAY_DEBUG=true` 后，网关会对每次请求追加一行 JSON 到 `GATEWAY_DEBUG_JSONL_FILE`。
+
+每行会包含：
+- `request_id`、`timestamp`、`method`、`path`、`target_url`
+- `request_json`（原始入站请求 JSON）
+- `forwarded_request_json`（网关修复后的转发 JSON）
+- `status_code`
+- `response_json`（非流式为完整响应 JSON；流式为 SSE 中每个 `data:` 的 JSON 事件列表）
 
 ## 测试
 
