@@ -14,4 +14,4 @@ export PYTHONPATH=$PYTHONPATH:.
 
 # 启动服务
 echo "[INFO] 启动 Kimi Gateway..."
-python3 app/main.py
+python3 -m app.main
